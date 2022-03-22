@@ -18,7 +18,7 @@ use crate::api::{
 };
 use crate::config::{
     add_to_config, DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, RestoreConfig,
-    UserDeviceConfig, VmConfig, VsockConfig,
+    UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use crate::migration::get_vm_snapshot;
@@ -581,56 +581,62 @@ impl Vmm {
             }
         }
 
-        // First we stop the current VM and create a new one.
-        if let Some(ref mut vm) = self.vm {
-            let config = vm.get_config();
-            let serial_pty = vm.serial_pty();
-            let console_pty = vm.console_pty();
-            let console_resize_pipe = vm
-                .console_resize_pipe()
-                .as_ref()
-                .map(|pipe| pipe.try_clone().unwrap());
-            self.vm_shutdown()?;
+        // First we stop the current VM
+        let (config, serial_pty, console_pty, console_resize_pipe) =
+            if let Some(mut vm) = self.vm.take() {
+                let config = vm.get_config();
+                let serial_pty = vm.serial_pty();
+                let console_pty = vm.console_pty();
+                let console_resize_pipe = vm
+                    .console_resize_pipe()
+                    .as_ref()
+                    .map(|pipe| pipe.try_clone().unwrap());
+                vm.shutdown()?;
+                (config, serial_pty, console_pty, console_resize_pipe)
+            } else {
+                return Err(VmError::VmNotCreated);
+            };
 
-            let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;
-            let reset_evt = self.reset_evt.try_clone().map_err(VmError::EventFdClone)?;
+        let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;
+        let reset_evt = self.reset_evt.try_clone().map_err(VmError::EventFdClone)?;
+        #[cfg(feature = "gdb")]
+        let debug_evt = self
+            .vm_debug_evt
+            .try_clone()
+            .map_err(VmError::EventFdClone)?;
+        let activate_evt = self
+            .activate_evt
+            .try_clone()
+            .map_err(VmError::EventFdClone)?;
+
+        // The Linux kernel fires off an i8042 reset after doing the ACPI reset so there may be
+        // an event sitting in the shared reset_evt. Without doing this we get very early reboots
+        // during the boot process.
+        if self.reset_evt.read().is_ok() {
+            warn!("Spurious second reset event received. Ignoring.");
+        }
+
+        // Then we create the new VM
+        let mut vm = Vm::new(
+            config,
+            exit_evt,
+            reset_evt,
             #[cfg(feature = "gdb")]
-            let debug_evt = self
-                .vm_debug_evt
-                .try_clone()
-                .map_err(VmError::EventFdClone)?;
-            let activate_evt = self
-                .activate_evt
-                .try_clone()
-                .map_err(VmError::EventFdClone)?;
+            debug_evt,
+            &self.seccomp_action,
+            self.hypervisor.clone(),
+            activate_evt,
+            serial_pty,
+            console_pty,
+            console_resize_pipe,
+        )?;
 
-            // The Linux kernel fires off an i8042 reset after doing the ACPI reset so there may be
-            // an event sitting in the shared reset_evt. Without doing this we get very early reboots
-            // during the boot process.
-            if self.reset_evt.read().is_ok() {
-                warn!("Spurious second reset event received. Ignoring.");
-            }
-            self.vm = Some(Vm::new(
-                config,
-                exit_evt,
-                reset_evt,
-                #[cfg(feature = "gdb")]
-                debug_evt,
-                &self.seccomp_action,
-                self.hypervisor.clone(),
-                activate_evt,
-                serial_pty,
-                console_pty,
-                console_resize_pipe,
-            )?);
-        }
+        // And we boot it
+        vm.boot()?;
 
-        // Then we start the new VM.
-        if let Some(ref mut vm) = self.vm {
-            vm.boot()
-        } else {
-            Err(VmError::VmNotCreated)
-        }
+        self.vm = Some(vm);
+
+        Ok(())
     }
 
     fn vm_info(&self) -> result::Result<VmInfo, VmError> {
@@ -921,6 +927,32 @@ impl Vmm {
             // Update VmConfig by adding the new device.
             let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
             add_to_config(&mut config.net, net_cfg);
+            Ok(None)
+        }
+    }
+
+    fn vm_add_vdpa(&mut self, vdpa_cfg: VdpaConfig) -> result::Result<Option<Vec<u8>>, VmError> {
+        self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
+
+        {
+            // Validate the configuration change in a cloned configuration
+            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            add_to_config(&mut config.vdpa, vdpa_cfg.clone());
+            config.validate().map_err(VmError::ConfigValidation)?;
+        }
+
+        if let Some(ref mut vm) = self.vm {
+            let info = vm.add_vdpa(vdpa_cfg).map_err(|e| {
+                error!("Error when adding new vDPA device to the VM: {:?}", e);
+                e
+            })?;
+            serde_json::to_vec(&info)
+                .map(Some)
+                .map_err(VmError::SerializeJson)
+        } else {
+            // Update VmConfig by adding the new device.
+            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
+            add_to_config(&mut config.vdpa, vdpa_cfg);
             Ok(None)
         }
     }
@@ -1742,6 +1774,13 @@ impl Vmm {
                                     .map(ApiResponsePayload::VmAction);
                                 sender.send(response).map_err(Error::ApiResponseSend)?;
                             }
+                            ApiRequest::VmAddVdpa(add_vdpa_data, sender) => {
+                                let response = self
+                                    .vm_add_vdpa(add_vdpa_data.as_ref().clone())
+                                    .map_err(ApiError::VmAddVdpa)
+                                    .map(ApiResponsePayload::VmAction);
+                                sender.send(response).map_err(Error::ApiResponseSend)?;
+                            }
                             ApiRequest::VmAddVsock(add_vsock_data, sender) => {
                                 let response = self
                                     .vm_add_vsock(add_vsock_data.as_ref().clone())
@@ -1887,6 +1926,7 @@ mod unit_tests {
             },
             devices: None,
             user_devices: None,
+            vdpa: None,
             vsock: None,
             iommu: false,
             #[cfg(target_arch = "x86_64")]
@@ -2195,6 +2235,54 @@ mod unit_tests {
                 .clone()
                 .unwrap()[0],
             net_config
+        );
+    }
+
+    #[test]
+    fn test_vmm_vm_cold_add_vdpa() {
+        let mut vmm = create_dummy_vmm();
+        let vdpa_config = VdpaConfig::parse("path=/dev/vhost-vdpa,num_queues=2").unwrap();
+
+        assert!(matches!(
+            vmm.vm_add_vdpa(vdpa_config.clone()),
+            Err(VmError::VmNotCreated)
+        ));
+
+        let _ = vmm.vm_create(create_dummy_vm_config());
+        assert!(vmm
+            .vm_config
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .vdpa
+            .is_none());
+
+        let result = vmm.vm_add_vdpa(vdpa_config.clone());
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+        assert_eq!(
+            vmm.vm_config
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .vdpa
+                .clone()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            vmm.vm_config
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .vdpa
+                .clone()
+                .unwrap()[0],
+            vdpa_config
         );
     }
 

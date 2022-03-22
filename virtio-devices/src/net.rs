@@ -53,9 +53,20 @@ pub struct NetCtrlEpollHandler {
     pub queue_evt: EventFd,
     pub queue: Queue<GuestMemoryAtomic<GuestMemoryMmap>>,
     pub access_platform: Option<Arc<dyn AccessPlatform>>,
+    pub interrupt_cb: Arc<dyn VirtioInterrupt>,
+    pub queue_index: u16,
 }
 
 impl NetCtrlEpollHandler {
+    fn signal_used_queue(&self, queue_index: u16) -> result::Result<(), DeviceError> {
+        self.interrupt_cb
+            .trigger(VirtioInterruptType::Queue(queue_index))
+            .map_err(|e| {
+                error!("Failed to signal used queue: {:?}", e);
+                DeviceError::FailedSignalingUsedQueue(e)
+            })
+    }
+
     pub fn run_ctrl(
         &mut self,
         paused: Arc<AtomicBool>,
@@ -75,19 +86,33 @@ impl EpollHelperHandler for NetCtrlEpollHandler {
         match ev_type {
             CTRL_QUEUE_EVENT => {
                 if let Err(e) = self.queue_evt.read() {
-                    error!("failed to get ctl queue event: {:?}", e);
+                    error!("Failed to get control queue event: {:?}", e);
                     return true;
                 }
                 if let Err(e) = self
                     .ctrl_q
                     .process(&mut self.queue, self.access_platform.as_ref())
                 {
-                    error!("failed to process ctrl queue: {:?}", e);
+                    error!("Failed to process control queue: {:?}", e);
                     return true;
+                } else {
+                    match self.queue.needs_notification() {
+                        Ok(true) => {
+                            if let Err(e) = self.signal_used_queue(self.queue_index) {
+                                error!("Error signalling that control queue was used: {:?}", e);
+                                return true;
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            error!("Error getting notification state of control queue: {}", e);
+                            return true;
+                        }
+                    }
                 }
             }
             _ => {
-                error!("Unknown event for virtio-net");
+                error!("Unknown event for virtio-net control queue");
                 return true;
             }
         }
@@ -565,22 +590,25 @@ impl VirtioDevice for Net {
     ) -> ActivateResult {
         self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
 
-        let queue_num = queues.len();
+        let num_queues = queues.len();
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
-        if self.common.feature_acked(VIRTIO_NET_F_CTRL_VQ.into()) && queue_num % 2 != 0 {
-            let mut cvq_queue = queues.remove(queue_num - 1);
-            let cvq_queue_evt = queue_evts.remove(queue_num - 1);
+        if self.common.feature_acked(VIRTIO_NET_F_CTRL_VQ.into()) && num_queues % 2 != 0 {
+            let ctrl_queue_index = num_queues - 1;
+            let mut ctrl_queue = queues.remove(ctrl_queue_index);
+            let ctrl_queue_evt = queue_evts.remove(ctrl_queue_index);
 
-            cvq_queue.set_event_idx(event_idx);
+            ctrl_queue.set_event_idx(event_idx);
 
             let (kill_evt, pause_evt) = self.common.dup_eventfds();
             let mut ctrl_handler = NetCtrlEpollHandler {
                 kill_evt,
                 pause_evt,
                 ctrl_q: CtrlQueue::new(self.taps.clone()),
-                queue: cvq_queue,
-                queue_evt: cvq_queue_evt,
+                queue: ctrl_queue,
+                queue_evt: ctrl_queue_evt,
                 access_platform: self.common.access_platform.clone(),
+                queue_index: ctrl_queue_index as u16,
+                interrupt_cb: interrupt_cb.clone(),
             };
 
             let paused = self.common.paused.clone();

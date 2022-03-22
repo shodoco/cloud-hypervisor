@@ -22,10 +22,6 @@ enum Error {
     TestTimeout,
     #[error("Error: test failed")]
     TestFailed,
-    #[error("Error creating log file: {0}")]
-    ReportFileCreation(std::io::Error),
-    #[error("Error writing log file: {0}")]
-    ReportFileWrite(std::io::Error),
 }
 
 #[derive(Deserialize, Serialize)]
@@ -385,7 +381,7 @@ const TEST_LIST: [PerformanceTest; 15] = [
     },
 ];
 
-fn run_test_with_timetout(test: &'static PerformanceTest) -> Result<PerformanceTestResult, Error> {
+fn run_test_with_timeout(test: &'static PerformanceTest) -> Result<PerformanceTestResult, Error> {
     let (sender, receiver) = channel::<Result<PerformanceTestResult, Error>>();
     thread::spawn(move || {
         println!("Test '{}' running .. ({})", test.name, test.control);
@@ -452,7 +448,6 @@ fn main() {
         .get_matches();
 
     if cmd_arguments.is_present("list-tests") {
-        println!("List of available metrics tests:\n");
         for test in TEST_LIST.iter() {
             println!("\"{}\" ({})", test.name, test.control);
         }
@@ -465,17 +460,6 @@ fn main() {
         None => Vec::new(),
     };
 
-    let mut report_file: Box<dyn std::io::Write + Send> =
-        if let Some(file) = cmd_arguments.value_of("report-file") {
-            Box::new(
-                std::fs::File::create(std::path::Path::new(file))
-                    .map_err(Error::ReportFileCreation)
-                    .unwrap(),
-            )
-        } else {
-            Box::new(std::io::stderr())
-        };
-
     // Run performance tests sequentially and report results (in both readable/json format)
     let mut metrics_report: MetricsReport = Default::default();
 
@@ -483,13 +467,13 @@ fn main() {
 
     for test in TEST_LIST.iter() {
         if test_filter.is_empty() || test_filter.iter().any(|&s| test.name.contains(s)) {
-            match run_test_with_timetout(test) {
+            match run_test_with_timeout(test) {
                 Ok(r) => {
                     metrics_report.results.push(r);
                 }
                 Err(e) => {
                     eprintln!("Aborting test due to error: '{:?}'", e);
-                    break;
+                    std::process::exit(1);
                 }
             };
         }
@@ -497,13 +481,29 @@ fn main() {
 
     cleanup_tests();
 
-    // Todo: Report/upload to the metrics database
+    let mut report_file: Box<dyn std::io::Write + Send> =
+        if let Some(file) = cmd_arguments.value_of("report-file") {
+            Box::new(
+                std::fs::File::create(std::path::Path::new(file))
+                    .map_err(|e| {
+                        eprintln!("Error opening report file: {}: {}", file, e);
+                        std::process::exit(1);
+                    })
+                    .unwrap(),
+            )
+        } else {
+            Box::new(std::io::stdout())
+        };
+
     report_file
-        .write(
+        .write_all(
             serde_json::to_string_pretty(&metrics_report)
                 .unwrap()
                 .as_bytes(),
         )
-        .map_err(Error::ReportFileWrite)
+        .map_err(|e| {
+            eprintln!("Error writing report file: {}", e);
+            std::process::exit(1);
+        })
         .unwrap();
 }
